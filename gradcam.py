@@ -4,17 +4,17 @@ import tensorflow as tf
 import gc
 
 # ============================================================
-# 🔹 Preprocesamiento de imagen
+# 🔹 Preprocesamiento
 # ============================================================
 def preprocess_bgr_to_model(img_bgr, size=224):
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     img_rgb = cv2.resize(img_rgb, (size, size))
     x = img_rgb.astype(np.float32) / 255.0
-    return np.expand_dims(x, axis=0)  # (1,224,224,3)
+    return np.expand_dims(x, axis=0)
 
 
 # ============================================================
-# 🔹 Localizar última capa convolucional
+# 🔹 Buscar la última capa convolucional
 # ============================================================
 def find_last_conv_layer(model):
     for layer in reversed(model.layers):
@@ -23,26 +23,37 @@ def find_last_conv_layer(model):
                 return layer.name
         except Exception:
             continue
-    return "Conv_1"  # fallback
+    return "Conv_1"
 
 
 # ============================================================
-# 🔹 Generar Grad-CAM
+# 🔹 Grad-CAM
 # ============================================================
 def make_gradcam_heatmap(model, img_array, last_conv_layer_name=None):
     if last_conv_layer_name is None:
         last_conv_layer_name = find_last_conv_layer(model)
 
+    # Asegura que el modelo sea compatible (multioutput → solo primera salida)
+    model_output = model.output
+    if isinstance(model_output, (list, tuple)):
+        model_output = model_output[0]
+
     grad_model = tf.keras.models.Model(
         [model.inputs],
-        [model.get_layer(last_conv_layer_name).output, model.output],
+        [model.get_layer(last_conv_layer_name).output, model_output],
     )
 
     with tf.GradientTape() as tape:
         conv_outputs, predictions = grad_model(img_array)
-        # Asegurar índice correcto
-        class_idx = tf.argmax(predictions[0])
-        loss = predictions[:, class_idx]
+
+        # Si predictions es lista o tupla → tomar primer tensor
+        if isinstance(predictions, (list, tuple)):
+            predictions = predictions[0]
+
+        # Asegurar vector correcto
+        predictions = tf.reshape(predictions, [-1])
+        class_idx = tf.argmax(predictions)
+        loss = predictions[class_idx]
 
     grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
@@ -54,22 +65,18 @@ def make_gradcam_heatmap(model, img_array, last_conv_layer_name=None):
     maxv = np.max(heatmap) if np.max(heatmap) > 0 else 1e-7
     heatmap /= maxv
 
-    # ⚙️ FIX: convertir el class_idx a int puro sin importar el tipo
-    try:
-        if hasattr(class_idx, "numpy"):
-            class_idx = class_idx.numpy()
-        if isinstance(class_idx, (np.ndarray, list, tuple)):
-            class_idx = int(np.array(class_idx).flatten()[0])
-        else:
-            class_idx = int(class_idx)
-    except Exception:
-        class_idx = int(tf.argmax(predictions[0]).numpy())
+    # Convertir class_idx a entero puro
+    class_idx = int(class_idx.numpy()) if hasattr(class_idx, "numpy") else int(class_idx)
 
-    return heatmap, class_idx, predictions.numpy()[0]
+    # Pasar predicciones a numpy (vector)
+    preds_np = predictions.numpy() if hasattr(predictions, "numpy") else np.array(predictions)
+    preds_np = np.squeeze(preds_np)
+
+    return heatmap, class_idx, preds_np
 
 
 # ============================================================
-# 🔹 Superponer Grad-CAM sobre la imagen original
+# 🔹 Superponer mapa de calor
 # ============================================================
 def overlay_heatmap_on_image(orig_bgr, heatmap, alpha=0.4):
     h, w = orig_bgr.shape[:2]
@@ -88,5 +95,5 @@ def release_tf_memory(model=None):
         tf.keras.backend.clear_session()
         del model
         gc.collect()
-    except:
+    except Exception:
         pass
