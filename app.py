@@ -31,7 +31,7 @@ loaded = {}  # Cache de modelos {species: (model, labels)}
 # ============================================================
 
 def load_model_and_labels(species):
-    """Carga el modelo y normaliza las etiquetas sin importar su formato."""
+    """Carga el modelo y normaliza las etiquetas sin importar el formato JSON."""
     if species in loaded:
         return loaded[species]
 
@@ -41,27 +41,40 @@ def load_model_and_labels(species):
     if not os.path.exists(model_path) or not os.path.exists(labels_path):
         raise FileNotFoundError(f"Modelo o labels no encontrados para: {species}")
 
-    # Cargar modelo
     model = tf.keras.models.load_model(model_path, compile=False)
 
-    # Cargar y normalizar labels
+    # 🧠 Cargar y limpiar labels en cualquier formato posible
     with open(labels_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
+        # Caso 1: {"0": "A", "1": "B"}
         if isinstance(raw, dict):
-            # Ejemplo: {"0": "A", "1": "B"}
             labels = [v for _, v in sorted(raw.items(), key=lambda x: int(x[0]))]
+
+        # Caso 2: [["0","A"],["1","B"]]  o  [[0,"A"],[1,"B"]]
+        elif isinstance(raw, list) and all(isinstance(x, (list, tuple)) and len(x) == 2 for x in raw):
+            labels = [x[1] for x in sorted(raw, key=lambda y: int(y[0]))]
+
+        # Caso 3: [["A","B","C"]] o [["A"],["B"]]
+        elif isinstance(raw, list) and all(isinstance(x, (list, tuple)) for x in raw):
+            flat = []
+            for x in raw:
+                for v in x:
+                    if isinstance(v, str):
+                        flat.append(v)
+            labels = flat
+
+        # Caso 4: ["A", "B", "C"]
         elif isinstance(raw, list):
-            if all(isinstance(x, list) and len(x) == 2 for x in raw):
-                # Ejemplo: [["0","A"],["1","B"]]
-                labels = [x[1] for x in sorted(raw, key=lambda y: int(y[0]))]
-            else:
-                labels = raw
+            labels = raw
+
         else:
-            raise ValueError("Formato de labels.json no reconocido")
+            raise ValueError(f"Formato de labels.json no reconocido: {type(raw)}")
 
     loaded[species] = (model, labels)
+    print(f"✅ Labels cargadas correctamente para {species}: {labels}")
     return model, labels
+
 
 
 # ============================================================
