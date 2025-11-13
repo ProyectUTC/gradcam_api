@@ -63,12 +63,57 @@ def load_model_and_labels(species):
 
 
 # ============================================================
+<<<<<<< HEAD
 # ✅ RUTA DE PRUEBA / SALUD
 # ============================================================
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
+=======
+# 🔹 Grad-CAM (con soporte para class_idx)
+# ============================================================
+def make_gradcam_heatmap(model, img_array, class_idx=None, last_conv_layer_name=None):
+    if last_conv_layer_name is None:
+        last_conv_layer_name = find_last_conv_layer(model)
+
+    model_output = model.output
+    if isinstance(model_output, (list, tuple)):
+        model_output = model_output[0]
+
+    grad_model = tf.keras.models.Model(
+        [model.inputs],
+        [model.get_layer(last_conv_layer_name).output, model_output],
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+
+        if isinstance(predictions, (list, tuple)):
+            predictions = predictions[0]
+        predictions = tf.reshape(predictions, [-1])
+
+        # Si no se especifica, usar la clase más probable
+        if class_idx is None:
+            class_idx = tf.argmax(predictions)
+        loss = predictions[class_idx]
+
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    conv_outputs = conv_outputs[0]
+    heatmap = tf.reduce_mean(conv_outputs * pooled_grads, axis=-1)
+
+    heatmap = np.maximum(heatmap.numpy(), 0)
+    if np.max(heatmap) > 0:
+        heatmap /= np.max(heatmap)
+
+    class_idx = int(class_idx.numpy()) if hasattr(class_idx, "numpy") else int(class_idx)
+    preds_np = predictions.numpy() if hasattr(predictions, "numpy") else np.array(predictions)
+    preds_np = np.squeeze(preds_np)
+
+    return heatmap, class_idx, preds_np
+>>>>>>> 962461a4d0d797377c8a09ecac9ac734c89b9eb7
 
 
 # ============================================================
