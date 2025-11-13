@@ -46,35 +46,20 @@ def load_model_and_labels(species):
     # 🧠 Cargar y limpiar labels en cualquier formato posible
     with open(labels_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
-
-        # Caso 1: {"0": "A", "1": "B"}
         if isinstance(raw, dict):
             labels = [v for _, v in sorted(raw.items(), key=lambda x: int(x[0]))]
-
-        # Caso 2: [["0","A"],["1","B"]]  o  [[0,"A"],[1,"B"]]
         elif isinstance(raw, list) and all(isinstance(x, (list, tuple)) and len(x) == 2 for x in raw):
             labels = [x[1] for x in sorted(raw, key=lambda y: int(y[0]))]
-
-        # Caso 3: [["A","B","C"]] o [["A"],["B"]]
         elif isinstance(raw, list) and all(isinstance(x, (list, tuple)) for x in raw):
-            flat = []
-            for x in raw:
-                for v in x:
-                    if isinstance(v, str):
-                        flat.append(v)
-            labels = flat
-
-        # Caso 4: ["A", "B", "C"]
+            labels = [v for sub in raw for v in sub if isinstance(v, str)]
         elif isinstance(raw, list):
             labels = raw
-
         else:
             raise ValueError(f"Formato de labels.json no reconocido: {type(raw)}")
 
     loaded[species] = (model, labels)
     print(f"✅ Labels cargadas correctamente para {species}: {labels}")
     return model, labels
-
 
 
 # ============================================================
@@ -95,6 +80,7 @@ def gradcam():
     """Genera Grad-CAM y devuelve predicción + mapa de calor."""
     species = request.form.get("species")
     file = request.files.get("image")
+    target_label = request.form.get("target_label")  # 👈 NUEVO parámetro opcional
 
     if not species or not file:
         return jsonify({"error": "Parámetros requeridos: species, image"}), 400
@@ -110,34 +96,39 @@ def gradcam():
         # Preprocesar imagen
         inp = preprocess_bgr_to_model(img_bgr, size=224)
 
-        # Inferencia + Grad-CAM
-        heatmap, class_idx, probs = make_gradcam_heatmap(model, inp)
+        # 🔹 Inferencia del modelo
+        preds = model.predict(inp)
+        probs = preds[0].tolist()
+
+        # 🔹 Si se envió una clase específica → usarla
+        if target_label and target_label in labels:
+            class_idx = labels.index(target_label)
+        else:
+            class_idx = int(np.argmax(preds[0]))
+
+        # 🔹 Generar Grad-CAM para esa clase
+        heatmap, _, _ = make_gradcam_heatmap(model, inp, class_idx=class_idx)
         blended = overlay_heatmap_on_image(img_bgr, heatmap, alpha=0.45)
 
-        # Codificar imágenes a base64
+        # 🔹 Codificar imágenes a base64
         _, buffer_blend = cv2.imencode(".jpg", blended)
         b64_blended = base64.b64encode(buffer_blend.tobytes()).decode("utf-8")
 
-        _, buffer_orig = cv2.imencode(".jpg", img_bgr)
-        b64_orig = base64.b64encode(buffer_orig.tobytes()).decode("utf-8")
-
-        # Mapear probabilidades y ordenarlas
-        probs = np.array(probs, dtype=float).tolist()
+        # 🔹 Mapear y ordenar probabilidades
         probs_map = {labels[i]: float(probs[i]) for i in range(len(labels))}
         sorted_probs = sorted(probs_map.items(), key=lambda x: x[1], reverse=True)
 
-        # Respuesta JSON
-        response = jsonify({
+        # 🔹 Construir respuesta JSON
+        response = {
             "species": species,
             "predicted_label": labels[class_idx],
+            "target_label": target_label,
             "topk": [{"label": k, "prob": v} for k, v in sorted_probs],
-            "image_original_b64": b64_orig,
-            "image_gradcam_b64": b64_blended
-        })
+            "image_gradcam_b64": b64_blended,
+        }
 
-        # 👇 Liberar memoria después de procesar (para Render Free)
         release_tf_memory(model)
-        return response
+        return jsonify(response)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
