@@ -2,7 +2,7 @@
 # 🌿 APP BACKEND - GradCAM API para AgroIA
 # ============================================================
 
-import os, io, json, base64, gc
+import os, json, base64
 from flask import Flask, request, jsonify
 from PIL import Image
 import numpy as np
@@ -13,7 +13,7 @@ from gradcam import (
     preprocess_bgr_to_model,
     make_gradcam_heatmap,
     overlay_heatmap_on_image,
-    release_tf_memory
+    release_tf_memory,
 )
 
 # ============================================================
@@ -23,41 +23,55 @@ from gradcam import (
 app = Flask(__name__)
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
-loaded = {}  # Cache de modelos {species: (model, labels)}
 
 
 # ============================================================
 # 📦 CARGA DE MODELOS Y ETIQUETAS (ROBUSTA)
 # ============================================================
 
-def load_model_and_labels(species):
-    """Carga el modelo y normaliza las etiquetas sin importar el formato JSON."""
-    if species in loaded:
-        return loaded[species]
-
+def load_model_and_labels(species: str):
+    """
+    Carga el modelo y normaliza las etiquetas sin importar el formato JSON.
+    Formatos soportados para labels.json:
+      1) {"0": "A", "1": "B"}
+      2) [["0", "A"], ["1", "B"]] o [[0, "A"], [1, "B"]]
+      3) [["A", "B", "C"]] o [["A"], ["B"]]
+      4) ["A", "B", "C"]
+    """
     model_path = os.path.join(MODELS_DIR, f"{species}_model.h5")
     labels_path = os.path.join(MODELS_DIR, f"{species}_labels.json")
 
     if not os.path.exists(model_path) or not os.path.exists(labels_path):
         raise FileNotFoundError(f"Modelo o labels no encontrados para: {species}")
 
+    # Cargar modelo (sin recompilar)
     model = tf.keras.models.load_model(model_path, compile=False)
 
-    # 🧠 Cargar y limpiar labels en cualquier formato posible
+    # Cargar labels
     with open(labels_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
+
+        # Caso 1: {"0": "A", "1": "B"}
         if isinstance(raw, dict):
             labels = [v for _, v in sorted(raw.items(), key=lambda x: int(x[0]))]
-        elif isinstance(raw, list) and all(isinstance(x, (list, tuple)) and len(x) == 2 for x in raw):
+
+        # Caso 2: [["0","A"],["1","B"]]  o  [[0,"A"],[1,"B"]]
+        elif isinstance(raw, list) and all(
+            isinstance(x, (list, tuple)) and len(x) == 2 for x in raw
+        ):
             labels = [x[1] for x in sorted(raw, key=lambda y: int(y[0]))]
+
+        # Caso 3: [["A","B","C"]] o [["A"],["B"]]
         elif isinstance(raw, list) and all(isinstance(x, (list, tuple)) for x in raw):
             labels = [v for sub in raw for v in sub if isinstance(v, str)]
+
+        # Caso 4: ["A", "B", "C"]
         elif isinstance(raw, list):
             labels = raw
+
         else:
             raise ValueError(f"Formato de labels.json no reconocido: {type(raw)}")
 
-    loaded[species] = (model, labels)
     print(f"✅ Labels cargadas correctamente para {species}: {labels}")
     return model, labels
 
@@ -76,11 +90,18 @@ def health():
 # ============================================================
 
 @app.route("/gradcam", methods=["POST"])
-def gradcam():
-    """Genera Grad-CAM y devuelve predicción + mapa de calor."""
+def gradcam_route():
+    """
+    Genera Grad-CAM y devuelve:
+      - species
+      - predicted_label
+      - target_label (si se envió)
+      - topk (todas las clases ordenadas)
+      - image_gradcam_b64 (mapa de calor superpuesto)
+    """
     species = request.form.get("species")
     file = request.files.get("image")
-    target_label = request.form.get("target_label")  # 👈 NUEVO parámetro opcional
+    target_label = request.form.get("target_label")  # 👈 parámetro opcional
 
     if not species or not file:
         return jsonify({"error": "Parámetros requeridos: species, image"}), 400
@@ -93,44 +114,60 @@ def gradcam():
         img = Image.open(file.stream).convert("RGB")
         img_bgr = np.array(img)[:, :, ::-1]  # RGB → BGR
 
-        # Preprocesar imagen
+        # Preprocesar imagen al tamaño del modelo
         inp = preprocess_bgr_to_model(img_bgr, size=224)
 
-        # 🔹 Inferencia del modelo
+        # Inferencia
         preds = model.predict(inp)
-        probs = preds[0].tolist()
+        preds = np.array(preds)
+        if preds.ndim > 2:
+            preds = np.squeeze(preds, axis=0)
+        probs = preds.tolist()
 
-        # 🔹 Si se envió una clase específica → usarla
+        # Índice de clase:
+        #  - si target_label está en labels → usamos esa clase
+        #  - si no → usamos la clase de probabilidad máxima
         if target_label and target_label in labels:
             class_idx = labels.index(target_label)
         else:
-            class_idx = int(np.argmax(preds[0]))
+            class_idx = int(np.argmax(preds))
 
-        # 🔹 Generar Grad-CAM para esa clase
-        heatmap, _, _ = make_gradcam_heatmap(model, inp, class_idx=class_idx)
+        # Grad-CAM para esa clase
+        heatmap, class_idx_used, preds_vec = make_gradcam_heatmap(
+            model,
+            inp,
+            class_idx=class_idx,
+        )
         blended = overlay_heatmap_on_image(img_bgr, heatmap, alpha=0.45)
 
-        # 🔹 Codificar imágenes a base64
+        # Codificar mapa de calor a base64
         _, buffer_blend = cv2.imencode(".jpg", blended)
         b64_blended = base64.b64encode(buffer_blend.tobytes()).decode("utf-8")
 
-        # 🔹 Mapear y ordenar probabilidades
-        probs_map = {labels[i]: float(probs[i]) for i in range(len(labels))}
+        # Mapear y ordenar probabilidades
+        preds_vec = np.array(preds_vec, dtype=float)
+        probs_map = {
+            labels[i]: float(preds_vec[i]) for i in range(len(labels))
+        }
         sorted_probs = sorted(probs_map.items(), key=lambda x: x[1], reverse=True)
 
-        # 🔹 Construir respuesta JSON
         response = {
             "species": species,
-            "predicted_label": labels[class_idx],
+            "predicted_label": labels[class_idx_used],
             "target_label": target_label,
-            "topk": [{"label": k, "prob": v} for k, v in sorted_probs],
+            "topk": [
+                {"label": k, "prob": v}
+                for k, v in sorted_probs
+            ],
             "image_gradcam_b64": b64_blended,
         }
 
-        release_tf_memory(model)
+        # Liberar memoria de TensorFlow
+        release_tf_memory()
         return jsonify(response)
 
     except Exception as e:
+        print("❌ Error en /gradcam:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -139,4 +176,5 @@ def gradcam():
 # ============================================================
 
 if __name__ == "__main__":
+    # host 0.0.0.0 para pruebas en red local si quieres
     app.run(host="0.0.0.0", port=5000, debug=True)
