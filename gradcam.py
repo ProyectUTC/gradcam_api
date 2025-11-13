@@ -27,13 +27,12 @@ def find_last_conv_layer(model):
 
 
 # ============================================================
-# 🔹 Grad-CAM
+# 🔹 Grad-CAM (con soporte para class_idx)
 # ============================================================
-def make_gradcam_heatmap(model, img_array, last_conv_layer_name=None):
+def make_gradcam_heatmap(model, img_array, class_idx=None, last_conv_layer_name=None):
     if last_conv_layer_name is None:
         last_conv_layer_name = find_last_conv_layer(model)
 
-    # Asegura que el modelo sea compatible (multioutput → solo primera salida)
     model_output = model.output
     if isinstance(model_output, (list, tuple)):
         model_output = model_output[0]
@@ -46,13 +45,13 @@ def make_gradcam_heatmap(model, img_array, last_conv_layer_name=None):
     with tf.GradientTape() as tape:
         conv_outputs, predictions = grad_model(img_array)
 
-        # Si predictions es lista o tupla → tomar primer tensor
         if isinstance(predictions, (list, tuple)):
             predictions = predictions[0]
-
-        # Asegurar vector correcto
         predictions = tf.reshape(predictions, [-1])
-        class_idx = tf.argmax(predictions)
+
+        # Si no se especifica, usar la clase más probable
+        if class_idx is None:
+            class_idx = tf.argmax(predictions)
         loss = predictions[class_idx]
 
     grads = tape.gradient(loss, conv_outputs)
@@ -62,13 +61,10 @@ def make_gradcam_heatmap(model, img_array, last_conv_layer_name=None):
     heatmap = tf.reduce_mean(conv_outputs * pooled_grads, axis=-1)
 
     heatmap = np.maximum(heatmap.numpy(), 0)
-    maxv = np.max(heatmap) if np.max(heatmap) > 0 else 1e-7
-    heatmap /= maxv
+    if np.max(heatmap) > 0:
+        heatmap /= np.max(heatmap)
 
-    # Convertir class_idx a entero puro
     class_idx = int(class_idx.numpy()) if hasattr(class_idx, "numpy") else int(class_idx)
-
-    # Pasar predicciones a numpy (vector)
     preds_np = predictions.numpy() if hasattr(predictions, "numpy") else np.array(predictions)
     preds_np = np.squeeze(preds_np)
 
