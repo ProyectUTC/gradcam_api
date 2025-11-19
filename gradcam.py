@@ -3,95 +3,97 @@ import cv2
 import tensorflow as tf
 import gc
 
-# ============================================================
-# 🔹 Preprocesamiento
-# ============================================================
-def preprocess_bgr_to_model(img_bgr, size=224):
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_rgb = cv2.resize(img_rgb, (size, size))
-    x = img_rgb.astype(np.float32) / 255.0
-    return np.expand_dims(x, axis=0)
+# -----------------------------------------------------------
+# 🔹 Crear las 3 versiones requeridas por tu modelo
+# -----------------------------------------------------------
+def preprocess_multi_inputs(orig_bgr, size=224):
+
+    # ---- COLOR ----
+    img_color = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
+    img_color = cv2.resize(img_color, (size, size))
+    x_color = img_color.astype(np.float32) / 255.0
+
+    # ---- GRAY ----
+    gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY)
+    gray_3ch = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    gray_3ch = cv2.resize(gray_3ch, (size, size))
+    x_gray = gray_3ch.astype(np.float32) / 255.0
+
+    # ---- SEGMENTACIÓN SIMPLE ----
+    hsv = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([25, 40, 20])   # valores estándar para verde
+    upper = np.array([90, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+
+    seg = cv2.bitwise_and(orig_bgr, orig_bgr, mask=mask)
+    seg = cv2.cvtColor(seg, cv2.COLOR_BGR2RGB)
+    seg = cv2.resize(seg, (size, size))
+    x_seg = seg.astype(np.float32) / 255.0
+
+    return (
+        np.expand_dims(x_color, 0),
+        np.expand_dims(x_gray, 0),
+        np.expand_dims(x_seg, 0),
+    )
 
 
-# ============================================================
-# 🔹 Buscar última capa convolucional
-# ============================================================
+# -----------------------------------------------------------
+# 🔹 Encontrar última capa conv (usamos solo la rama color)
+# -----------------------------------------------------------
 def find_last_conv_layer(model):
     for layer in reversed(model.layers):
         try:
-            if len(layer.output.shape) == 4:
+            s = layer.output.shape
+            if len(s) == 4:
                 return layer.name
         except:
-            continue
-    return None  # Mejor que devolver algo incorrecto
+            pass
+    return None
 
 
-# ============================================================
-# 🔹 Grad-CAM con soporte para class_idx
-# ============================================================
-def make_gradcam_heatmap(model, img_array, class_idx=None, last_conv_layer_name=None):
+# -----------------------------------------------------------
+# 🔹 Grad-CAM SOLO sobre el input color
+# -----------------------------------------------------------
+def make_gradcam_heatmap(model, x_color, class_idx):
 
-    # Si no se especifica capa, encontrar la última conv
-    if last_conv_layer_name is None:
-        last_conv_layer_name = find_last_conv_layer(model)
+    last_conv = find_last_conv_layer(model)
 
-    if last_conv_layer_name is None:
-        raise ValueError("❌ No se encontró ninguna capa convolucional en el modelo.")
-
-    # Crear modelo parcial (conv + output)
     grad_model = tf.keras.models.Model(
         [model.inputs],
-        [
-            model.get_layer(last_conv_layer_name).output,
-            model.output if not isinstance(model.output, (list, tuple)) else model.output[0]
-        ],
+        [model.get_layer(last_conv).output, model.output]
     )
 
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_array)
+        conv_out, preds = grad_model([x_color, x_color, x_color])
+        loss = preds[:, class_idx]
 
-        # Asegurar que predictions es un vector
-        if isinstance(predictions, (list, tuple)):
-            predictions = predictions[0]
+    grads = tape.gradient(loss, conv_out)
+    pooled = tf.reduce_mean(grads, axis=(0,1,2))
+    conv_out = conv_out[0]
 
-        predictions = tf.reshape(predictions, [-1])
-
-        # Elegir la clase:
-        if class_idx is None:
-            class_idx = int(tf.argmax(predictions))
-        else:
-            class_idx = int(class_idx)
-
-        loss = predictions[class_idx]
-
-    # Calcular gradientes
-    grads = tape.gradient(loss, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-    conv_outputs = conv_outputs[0]
-    heatmap = tf.reduce_mean(conv_outputs * pooled_grads, axis=-1)
+    heatmap = tf.reduce_mean(conv_out * pooled, axis=-1)
 
     heatmap = np.maximum(heatmap.numpy(), 0)
-    maxv = np.max(heatmap) if np.max(heatmap) > 0 else 1e-6
-    heatmap /= maxv
+    heatmap /= np.max(heatmap) + 1e-7
 
-    return heatmap, class_idx, predictions.numpy()
+    return heatmap
 
 
-# ============================================================
-# 🔹 Superponer mapa de calor
-# ============================================================
+# -----------------------------------------------------------
+# 🔹 Superposición de Grad-CAM
+# -----------------------------------------------------------
 def overlay_heatmap_on_image(orig_bgr, heatmap, alpha=0.45):
     h, w = orig_bgr.shape[:2]
     heatmap = cv2.resize(heatmap, (w, h))
     heatmap = np.uint8(255 * heatmap)
     heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    return cv2.addWeighted(orig_bgr, 1 - alpha, heatmap_color, alpha, 0)
+    blended = cv2.addWeighted(orig_bgr, 1 - alpha, heatmap_color, alpha, 0)
+    return blended
 
 
-# ============================================================
+# -----------------------------------------------------------
 # 🔹 Liberar memoria
-# ============================================================
+# -----------------------------------------------------------
 def release_tf_memory(model=None):
     try:
         tf.keras.backend.clear_session()
