@@ -3,19 +3,19 @@ import cv2
 import tensorflow as tf
 import gc
 
-
 # ============================================================
 # 🔹 Preprocesamiento multicanal
 # ============================================================
 
 def preprocess_multi_inputs(img_bgr, size=224):
 
-    # --- Color ---
-    color = cv2.resize(img_bgr, (size, size)).astype(np.float32) / 255.0
+    # --- Color (RGB Normal) ---
+    color = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    color = cv2.resize(color, (size, size)).astype(np.float32) / 255.0
 
-    # --- Grayscale ---
+    # --- Grayscale (3 canales) ---
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
     gray = cv2.resize(gray, (size, size)).astype(np.float32) / 255.0
 
     # --- Segmentación rápida ---
@@ -24,6 +24,7 @@ def preprocess_multi_inputs(img_bgr, size=224):
     upper = np.array([95, 255, 255])
     mask = cv2.inRange(hsv, lower, upper)
     seg = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
+    seg = cv2.cvtColor(seg, cv2.COLOR_BGR2RGB)
     seg = cv2.resize(seg, (size, size)).astype(np.float32) / 255.0
 
     return (
@@ -37,26 +38,32 @@ def preprocess_multi_inputs(img_bgr, size=224):
 # 🔹 GradCAM para modelos multicanal
 # ============================================================
 
-def make_gradcam_multibranch(model, inputs, class_idx):
+def make_gradcam_multibranch(model, inputs_dict, class_idx):
 
-    # Obtener la última capa convolucional de cualquiera de las ramas
+    # Encontrar última capa convolucional compartida
     last_conv_name = None
     for layer in model.layers[::-1]:
-        if len(layer.output.shape) == 4:
-            last_conv_name = layer.name
-            break
+        try:
+            if len(layer.output.shape) == 4:
+                last_conv_name = layer.name
+                break
+        except:
+            pass
 
-    if not last_conv_name:
-        raise ValueError("No se encontró capa conv final.")
+    if last_conv_name is None:
+        raise ValueError("❌ No se encontró una capa convolucional válida para Grad-CAM.")
 
     grad_model = tf.keras.models.Model(
-        inputs=[model.inputs],
-        outputs=[model.get_layer(last_conv_name).output, model.output]
+        inputs=model.inputs,
+        outputs=[
+            model.get_layer(last_conv_name).output,
+            model.output
+        ]
     )
 
     with tf.GradientTape() as tape:
-        conv_outs, preds = grad_model(inputs)
-        preds = preds[0]
+        conv_outs, preds = grad_model(inputs_dict)
+        preds = tf.reshape(preds, [-1])
         loss = preds[class_idx]
 
     grads = tape.gradient(loss, conv_outs)[0]
@@ -65,7 +72,7 @@ def make_gradcam_multibranch(model, inputs, class_idx):
 
     heatmap = tf.reduce_mean(conv * pooled, axis=-1).numpy()
     heatmap = np.maximum(heatmap, 0)
-    heatmap /= np.max(heatmap + 1e-7)
+    heatmap /= (np.max(heatmap) + 1e-7)
 
     return heatmap
 
