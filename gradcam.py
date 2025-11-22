@@ -101,4 +101,3 @@ def release_tf_memory(model=None):
         gc.collect()
     except:
         pass
-
